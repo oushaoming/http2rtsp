@@ -18,8 +18,9 @@
 #include <sys/wait.h>
 #include <sys/select.h>
 #include <fcntl.h>
+#include <sys/prctl.h>
 
-#define VERSION "1.1"
+#define VERSION "1.2"
 #define DEFAULT_PORT 8090
 #define DEFAULT_BUF_SIZE (32*1024)
 #define MAX_CLIENTS 10
@@ -730,8 +731,14 @@ static void usage(const char *prog) {
 
 int main(int argc, char *argv[]) {
     int opt;
+    char *argv_copy[argc + 1];
     
-    while ((opt = getopt(argc, argv, "p:c:B:vTh")) != -1) {
+    for (int i = 0; i < argc; i++) {
+        argv_copy[i] = argv[i];
+    }
+    argv_copy[argc] = NULL;
+    
+    while ((opt = getopt(argc, argv, "c:B:p:vTh")) != -1) {
         switch (opt) {
             case 'p': g_port = atoi(optarg); break;
             case 'c': g_max_clients = atoi(optarg); break;
@@ -741,6 +748,10 @@ int main(int argc, char *argv[]) {
             case 'h': usage(argv[0]); return 0;
             default: usage(argv[0]); return 1;
         }
+    }
+    
+    for (int i = 0; i < argc; i++) {
+        argv[i] = argv_copy[i];
     }
     
     if (g_daemon && daemon(0, 0) < 0) {

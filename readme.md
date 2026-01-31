@@ -33,8 +33,8 @@ mipsel-openwrt-linux-gcc -Wall -Os -s -o http2rtsp-mipsel http2rtsp.c
 
 ### 命令行参数
 - `-p <port>`: 指定 HTTP 监听端口（默认：8090）
-- `-m <max>`: 指定最大客户端连接数（默认：10）
-- `-b <size>`: 指定缓冲区大小（默认：32KB）
+- `-c <max>`: 指定最大客户端连接数（默认：10）
+- `-B <size>`: 指定缓冲区大小（默认：32KB）
 - `-v`: 启用详细日志
 - `-T`: 以非守护进程模式运行
 
@@ -44,7 +44,7 @@ mipsel-openwrt-linux-gcc -Wall -Os -s -o http2rtsp-mipsel http2rtsp.c
 ./http2rtsp -p 8090 -v -T
 
 # 限制最大 5 个客户端连接，缓冲区大小 64KB
-./http2rtsp -m 5 -b 65536
+./http2rtsp -c 5 -B 64
 ```
 
 ## URL 格式
@@ -110,4 +110,4 @@ MIT License
 
 ## 版本
 
-当前版本：1.1
+当前版本：1.2
