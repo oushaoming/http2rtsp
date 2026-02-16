@@ -20,7 +20,7 @@
 #include <fcntl.h>
 #include <sys/prctl.h>
 
-#define VERSION "1.2"
+#define VERSION "1.3"
 #define DEFAULT_PORT 8090
 #define DEFAULT_BUF_SIZE (32*1024)
 #define MAX_CLIENTS 10
@@ -30,6 +30,12 @@
 
 #define BUILD_DATE __DATE__
 #define BUILD_TIME __TIME__
+
+/* Configuration constants */
+#define RTSP_MAX_REDIRECTS 5
+#define RTSP_CONNECT_TIMEOUT_SEC 10
+#define RTSP_REQUEST_TIMEOUT_SEC 10
+#define RTSP_RESPONSE_TIMEOUT_SEC 10
 
 static int g_port = DEFAULT_PORT;
 static int g_max_clients = MAX_CLIENTS;
@@ -44,6 +50,7 @@ static int g_daemon = 1;
 #define HTTP_503_BUSY "HTTP/1.0 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 
 #define LOG(fmt, ...) do { if (g_verbose) fprintf(stderr, "[%d] " fmt "\n", getpid(), ##__VA_ARGS__); } while(0)
+#define PERROR(msg) do { if (g_verbose) perror(msg); } while(0)
 
 static void sigchld_handler(int sig) {
     (void)sig;
@@ -75,29 +82,116 @@ static int url_decode(const char *src, char *dst, int dst_len) {
 
 static int parse_rtsp_url(const char *url, char *host, int *port, char *path, int path_len) {
     const char *p = url;
+    const char *authority;
+    const char *path_start;
+    char *at_sign;
+    char *colon;
+    size_t host_len;
+    
+    if (!url || !host || !port || !path || path_len <= 0) {
+        LOG("Invalid parameters to parse_rtsp_url");
+        return -1;
+    }
+    
     *port = 554;
+    path[0] = '\0';
+    host[0] = '\0';
     
-    if (strncmp(p, "rtsp://", 7) != 0) return -1;
-    p += 7;
-    
-    const char *path_start = strchr(p, '/');
-    if (!path_start) {
-        strncpy(host, p, 255);
-        strcpy(path, "/");
+    /* Check URL format */
+    if (strncmp(p, "rtsp://", 7) == 0) {
+        p += 7;
+    } else if (strncmp(p, "rtsp/", 5) == 0) {
+        p += 5;
     } else {
-        int host_len = path_start - p;
-        if (host_len >= 256) host_len = 255;
-        strncpy(host, p, host_len);
-        host[host_len] = '\0';
-        strncpy(path, path_start, path_len - 1);
-        path[path_len - 1] = '\0';
+        LOG("Invalid URL format, must start with rtsp:// or rtsp/");
+        return -1;
     }
     
-    char *port_ptr = strchr(host, ':');
-    if (port_ptr) {
-        *port_ptr = '\0';
-        *port = atoi(port_ptr + 1);
+    /* Check for empty URL */
+    if (*p == '\0') {
+        LOG("Empty URL after protocol prefix");
+        return -1;
     }
+    
+    authority = p;
+    
+    /* Find path separator */
+    path_start = strchr(p, '/');
+    if (path_start) {
+        /* Extract path */
+        size_t path_len_copy = strlen(path_start);
+        if (path_len_copy >= (size_t)path_len) {
+            path_len_copy = path_len - 1;
+        }
+        strncpy(path, path_start, path_len_copy);
+        path[path_len_copy] = '\0';
+    } else {
+        strcpy(path, "/");
+    }
+    
+    /* Handle authentication (user:pass@host) */
+    at_sign = strrchr(authority, '@');
+    if (at_sign) {
+        /* Skip authentication part */
+        authority = at_sign + 1;
+        if (*authority == '\0') {
+            LOG("No host after authentication");
+            return -1;
+        }
+    }
+    
+    /* Handle IPv6 addresses [::1]:port */
+    if (authority[0] == '[') {
+        char *closing = strchr(authority, ']');
+        if (!closing) {
+            LOG("Invalid IPv6 address format");
+            return -1;
+        }
+        host_len = closing - authority - 1;
+        if (host_len >= 255) host_len = 254;
+        strncpy(host, authority + 1, host_len);
+        host[host_len] = '\0';
+        
+        /* Check for port after IPv6 address */
+        if (closing[1] == ':') {
+            colon = closing + 2;
+            *port = atoi(colon);
+        }
+    } else {
+        /* IPv4 or hostname */
+        size_t host_part_len = path_start ? (size_t)(path_start - authority) : strlen(authority);
+        
+        /* Find port separator */
+        colon = memchr(authority, ':', host_part_len);
+        if (colon) {
+            host_len = colon - authority;
+            if (host_len >= 256) host_len = 255;
+            strncpy(host, authority, host_len);
+            host[host_len] = '\0';
+            
+            /* Parse port */
+            *port = atoi(colon + 1);
+        } else {
+            host_len = host_part_len;
+            if (host_len >= 256) host_len = 255;
+            strncpy(host, authority, host_len);
+            host[host_len] = '\0';
+        }
+    }
+    
+    /* Validate port */
+    if (*port <= 0 || *port > 65535) {
+        LOG("Invalid port number: %d", *port);
+        *port = 554;
+    }
+    
+    /* Validate host */
+    if (host[0] == '\0') {
+        LOG("Empty hostname");
+        return -1;
+    }
+    
+    LOG("Parsed URL - host=%s, port=%d, path=%s", host, *port, path);
     
     return 0;
 }
@@ -230,7 +324,16 @@ static int rtsp_setup_play(int rtsp_fd, const char *url, int *rtp_channel, int *
     int cseq = 1;
     int content_len;
     char current_url[MAX_URL_LEN];
-    strncpy(current_url, url, sizeof(current_url)-1);
+    
+    // Convert URL to standard rtsp:// format if needed
+    if (strncmp(url, "rtsp/", 5) == 0) {
+        snprintf(current_url, sizeof(current_url), "rtsp://%s", url + 5);
+        LOG("Converted URL: %s -> %s", url, current_url);
+    } else {
+        strncpy(current_url, url, sizeof(current_url)-1);
+        current_url[sizeof(current_url)-1] = '\0';
+        LOG("Using URL: %s", current_url);
+    }
     
     LOG("Sending OPTIONS");
     if (send_rtsp_request(rtsp_fd, "OPTIONS", current_url, NULL, cseq++, NULL) < 0)
@@ -552,15 +655,17 @@ static void handle_client(int client_fd, struct sockaddr_in *client_addr) {
     
     LOG("Path part: %s", path_part);
     
-    /* 检查是否以 /rtsp:// 开头 */
-    if (strncmp(path_part, "/rtsp://", 8) != 0) {
-        LOG("Invalid URL format, must start with /rtsp://");
+    /* 检查是否以 /rtsp:// 或 /rtsp/ 开头 */
+    char *url_start = NULL;
+    if (strncmp(path_part, "/rtsp://", 8) == 0) {
+        url_start = path_part + 1;  /* 跳过第一个 /，得到 rtsp://... */
+    } else if (strncmp(path_part, "/rtsp/", 6) == 0) {
+        url_start = path_part + 1;  /* 跳过第一个 /，得到 rtsp/... */
+    } else {
+        LOG("Invalid URL format, must start with /rtsp:// or /rtsp/");
         send_all(client_fd, HTTP_404_NOT, strlen(HTTP_404_NOT), 2);
         goto cleanup;
     }
-    
-    /* 提取 rtsp://... 部分（去掉开头的 /） */
-    char *url_start = path_part + 1;  /* 跳过第一个 /，得到 rtsp://... */
     
     /* 处理可能的URL编码 */
     url_decode(url_start, rtsp_url, sizeof(rtsp_url));
@@ -568,7 +673,7 @@ static void handle_client(int client_fd, struct sockaddr_in *client_addr) {
     LOG("Target RTSP: %s", rtsp_url);
     
     /* 验证RTSP URL格式 */
-    if (strncmp(rtsp_url, "rtsp://", 7) != 0) {
+    if (strncmp(rtsp_url, "rtsp://", 7) != 0 && strncmp(rtsp_url, "rtsp/", 5) != 0) {
         send_all(client_fd, HTTP_400_BAD, strlen(HTTP_400_BAD), 2);
         goto cleanup;
     }
@@ -642,7 +747,7 @@ static int run_server(void) {
     
     listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
-        perror("socket");
+        PERROR("socket");
         return 1;
     }
     
@@ -655,13 +760,13 @@ static int run_server(void) {
     serv_addr.sin_port = htons(g_port);
     
     if (bind(listen_fd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-        perror("bind");
+        PERROR("bind");
         close(listen_fd);
         return 1;
     }
     
     if (listen(listen_fd, 5) < 0) {
-        perror("listen");
+        PERROR("listen");
         close(listen_fd);
         return 1;
     }
@@ -682,7 +787,7 @@ static int run_server(void) {
         int client_fd = accept(listen_fd, (struct sockaddr*)&client_addr, &addr_len);
         if (client_fd < 0) {
             if (errno == EINTR) continue;
-            perror("accept");
+            PERROR("accept");
             continue;
         }
         
@@ -696,7 +801,7 @@ static int run_server(void) {
         
         pid_t pid = fork();
         if (pid < 0) {
-            perror("fork");
+            PERROR("fork");
             close(client_fd);
         } else if (pid == 0) {
             close(listen_fd);
@@ -755,7 +860,7 @@ int main(int argc, char *argv[]) {
     }
     
     if (g_daemon && daemon(0, 0) < 0) {
-        perror("daemon");
+        PERROR("daemon");
         return 1;
     }
     
